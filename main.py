@@ -19,8 +19,6 @@ role_keyboard.add(btn1, btn2, btn3)
 bot = telebot.TeleBot(TOKEN)
 DB_NAME = 'bot_data.db'
 
-# --- google ---
-
 # --- 2. Функции для работы с базой данных ---
 
 def init_db():
