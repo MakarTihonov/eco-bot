@@ -3,9 +3,10 @@ from telebot import types
 import sqlite3
 import time
 
+
 # --- Константы  ---
-TOKEN = 'your token' 
-MAIN_ADMIN_ID = your name id 
+TOKEN = '' 
+MAIN_ADMIN_ID = 123456789 
 DB_NAME = 'bot_data.db'
 
 # --- Клавиатуры ---
@@ -171,18 +172,25 @@ def send_welcome(message):
 # команда help
 @bot.message_handler(commands=['help'])
 def help(message):
-    bot.send_message(message.chat.id, "Привет, вот, что я умею: \n"
-    "Команды для админа: /add_content /admin_panel\n"
+    bot.send_message(message.chat.id, "Привет, вот, что я умею: \n" \
+    "\n"
     "/view_content - посмотреть посты, которые доступны для вас. \n"
     "/admin - доступные команды для администратора. \n"
-    "/request_admin - для заявки на должность админимстратора. \n") 
+    "/request_admin - для заявки на должность админимстратора. \n"
+    "/report_admin - для жалобы на администратора или контент. \n"
+    "/change - изменить информацию профиля. \n"
+    "/profile - чтобы посмотреть свой профиль \n") 
 
 @bot.message_handler(commands=['admin'])
 def admin(message):
     user_id = message.chat.id
     status = get_user_status(user_id)
     if status == 'admin':
-        bot.send_message(message.chat.id, "Команды для админа: /add_content /admin_panel")
+        bot.send_message(message.chat.id, "Команды для админа: "
+        "/add_content \n"
+        "/admin_panel \n" 
+        "/manage_content \n" \
+        "")
     else:
         bot.send_message(message.chat.id, "Вы не являетесь администратором!")
 
@@ -460,44 +468,244 @@ def view_admin_list(message):
     else:
         bot.send_message(message.chat.id, "Кроме вас, администраторов нет.")
 
-# --- 5. Обработка Inline кнопок (Одобрение/Отклонение/Лишение прав) ---
+# --- 5. Обработка Inline кнопок (Одобрение/Отклонение/Лишение прав/Ответ/Удаление контента) ---
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    if call.message.chat.id != MAIN_ADMIN_ID:
-        bot.answer_callback_query(call.id, "У вас нет прав для выполнения этого действия.")
-        return
+    admin_id = call.message.chat.id
+    bot.answer_callback_query(call.id, "Обработка запроса...")
 
     try:
-        data = call.data.split('_')
-        action = data[0]
-        target_user_id = int(data[1])
+        data_parts = call.data.split('_')
+        action = data_parts[0] 
+        target_id_str = data_parts[-1]
+        target_id = int(target_id_str) 
     except (IndexError, ValueError):
-        bot.answer_callback_query(call.id, "Произошла ошибка при обработке запроса.")
+        bot.send_message(admin_id, "Произошла ошибка при обработке запроса (парсинг данных).")
         return
 
+    status = get_user_status(admin_id)
+
+    # --- Логика модерации админов (approve, reject, demote, reply) ---
+    if action in ['approve', 'reject', 'demote', 'reply'] and status != 'admin' and admin_id != MAIN_ADMIN_ID:
+         bot.send_message(admin_id, "У вас нет прав для выполнения этого действия.")
+         return
+    
     if action == 'approve':
-        update_user_status(target_user_id, 'admin')
-        bot.send_message(target_user_id, "🎉 Поздравляем! Ваша заявка одобрена, вы получили права администратора.")
-        bot.edit_message_text(f"{call.message.text}\n\n✅ Одобрено главным администратором.", 
-                              call.message.chat.id, call.message.message_id, reply_markup=None)
+        update_user_status(target_id, 'admin')
+        try: bot.send_message(target_id, "🎉 Поздравляем! Ваша заявка одобрена, вы получили права администратора.")
+        except: pass
+        bot.edit_message_text(f"{call.message.text}\n\n✅ Одобрено.", call.message.chat.id, call.message.message_id, reply_markup=None, parse_mode='HTML')
+    
     elif action == 'reject':
-        update_user_status(target_user_id, 'user')
-        bot.send_message(target_user_id, "❌ К сожалению, ваша заявка на администрирование была отклонена.")
-        bot.edit_message_text(f"{call.message.text}\n\n❌ Отклонено главным администратором.", 
-                              call.message.chat.id, call.message.message_id, reply_markup=None)
+        update_user_status(target_id, 'user')
+        try: bot.send_message(target_id, "❌ К сожалению, ваша заявка на администрирование была отклонена.")
+        except: pass
+        bot.edit_message_text(f"{call.message.text}\n\n❌ Отклонено.", call.message.chat.id, call.message.message_id, reply_markup=None, parse_mode='HTML')
+    
     elif action == 'demote':
-        if target_user_id == MAIN_ADMIN_ID:
-            bot.answer_callback_query(call.id, "Невозможно лишить прав главного администратора!")
-            return
-            
-        update_user_status(target_user_id, 'user')
-        bot.send_message(target_user_id, "🚨 Внимание! Вы были лишены прав администратора главным администратором.")
-        # Обновляем сообщение, из которого была вызвана кнопка
-        bot.edit_message_text(f"Пользователь (ID: {target_user_id}) лишен прав администратора.",
-                              call.message.chat.id, call.message.message_id, reply_markup=None)
-        # Отправляем новое сообщение, чтобы главный админ знал, что делать дальше
-        view_admin_list(call.message)
+        if target_id == MAIN_ADMIN_ID: bot.send_message(admin_id, "Невозможно лишить прав главного администратора!"); return
+        if admin_id != MAIN_ADMIN_ID: bot.send_message(admin_id, "Только главный администратор может лишать других прав. 🚫"); return
+        update_user_status(target_id, 'user')
+        try: bot.send_message(target_id, "🚨 Внимание! Вы были лишены прав администратора главным администратором.")
+        except: pass
+        bot.edit_message_text(f"Пользователь (ID: {target_id}) лишен прав администратора.", call.message.chat.id, call.message.message_id, reply_markup=None, parse_mode='HTML')
+    
+    elif action == 'reply':
+        if admin_id != MAIN_ADMIN_ID: bot.send_message(admin_id, "Это действие доступно только главному администратору."); return
+        msg = bot.send_message(admin_id, f"Введите ответ для пользователя {target_id}:")
+        bot.register_next_step_handler(msg, prompt_admin_reply, target_id)
+        bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
+
+    # --- Логика удаления контента ---
+    elif action == 'delete' and data_parts[1] == 'content':
+        content_id = target_id
+        # Проверяем, что удаляет свой контент (опционально, но безопасно)
+        content_list = get_admin_content(admin_id)
+        if any(item[0] == content_id for item in content_list):
+            delete_content_item(content_id)
+            bot.edit_message_text(f"✅ Пост #{content_id} удален.", 
+                                  chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
+        else:
+            bot.send_message(admin_id, "Вы можете удалить только свой контент!")
+
+
+# --- Функции профиля и изменения данных ---
+
+def get_user_details(user_id):
+    """Получает полную информацию о пользователе из БД."""
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT username, region, city, role, status FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+    return result
+
+@bot.message_handler(commands=['profile'])
+def view_profile(message):
+    user_id = message.chat.id
+    details = get_user_details(user_id)
+    if details:
+        username, region, city, role, status = details
+        response = (
+            f"👤 Ваш профиль:\n"
+            f"--------------------------\n"
+            f"Ник: @{username}\n"
+            f"Статус: {status}\n"
+            f"Роль: {role}\n"
+            f"Регион: {region}\n"
+            f"Город: {city}\n"
+            f"--------------------------\n"
+            f"Чтобы изменить данные: /change"
+        )
+        bot.send_message(user_id, response)
+    else:
+        bot.send_message(user_id, "Произошла ошибка при получении данных профиля. Попробуйте /start.")
+
+@bot.message_handler(commands=['change'])
+def prompt_change_data(message):
+    user_id = message.chat.id
+    if not is_user_registered(user_id):
+        enforce_registration(message)
+        return
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    btn_region = types.KeyboardButton('/edit_region Изменить регион')
+    btn_city = types.KeyboardButton('/edit_city Изменить город')
+    markup.add(btn_region, btn_city)
+    bot.send_message(user_id, "Что вы хотите изменить?", reply_markup=markup)
+
+@bot.message_handler(commands=['edit_region'])
+def edit_region_prompt(message):
+    user_id = message.chat.id
+    msg = bot.send_message(user_id, "Введите новое название вашего **региона**:", reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, process_new_region)
+
+def process_new_region(message):
+    user_id = message.chat.id
+    if message.content_type != 'text' or message.text.startswith('/'):
+        msg = bot.send_message(user_id, "Пожалуйста, введите корректное название региона текстом.")
+        bot.register_next_step_handler(msg, process_new_region)
+        return
+    
+    new_region = message.text
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET region = ? WHERE user_id = ?', (new_region, user_id))
+        conn.commit()
+    bot.send_message(user_id, f"✅ Ваш регион успешно изменен на: **{new_region}**", parse_mode='Markdown')
+
+@bot.message_handler(commands=['edit_city'])
+def edit_city_prompt(message):
+    user_id = message.chat.id
+    msg = bot.send_message(user_id, "Введите новое название вашего **города/населенного пункта**:", reply_markup=types.ReplyKeyboardRemove())
+    bot.register_next_step_handler(msg, process_new_city)
+
+def process_new_city(message):
+    user_id = message.chat.id
+    if message.content_type != 'text' or message.text.startswith('/'):
+        msg = bot.send_message(user_id, "Пожалуйста, введите корректное название города текстом.")
+        bot.register_next_step_handler(msg, process_new_city)
+        return
+
+    new_city = message.text
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET city = ? WHERE user_id = ?', (new_city, user_id))
+        conn.commit()
+    bot.send_message(user_id, f"✅ Ваш город успешно изменен на: **{new_city}**", parse_mode='Markdown')
+
+# --- Функция жалоб главному админу ---
+@bot.message_handler(commands=['report_admin'])
+def report_to_admin_prompt(message):
+    user_id = message.chat.id
+    msg = bot.send_message(user_id, "Опишите вашу жалобу или вопрос главному администратору. Будьте вежливы и информативны.")
+    bot.register_next_step_handler(msg, send_report_to_admin)
+
+def send_report_to_admin(message):
+    user_id = message.chat.id
+    report_text = message.text
+    username = message.from_user.username if message.from_user.username else f"ID: {user_id}"
+
+    if MAIN_ADMIN_ID:
+        # Используем HTML-форматирование, оно более устойчиво к случайным символам
+        report_message = (
+            f"<b>🚨 НОВАЯ ЖАЛОБА/ВОПРОС 🚨</b>\n\n"
+            f"От пользователя: @{username} (ID: {user_id})\n\n"
+            f"<b>Сообщение:</b>\n{report_text}"
+        )
+        
+        markup = types.InlineKeyboardMarkup()
+        # ИСПРАВЛЕНО: callback_data изменена на 'reply_'
+        btn_reply = types.InlineKeyboardButton("Ответить пользователю", callback_data=f"reply_{user_id}") 
+        markup.add(btn_reply)
+
+        try:
+            # Обязательно указываем parse_mode='HTML'
+            bot.send_message(MAIN_ADMIN_ID, report_message, parse_mode='HTML', reply_markup=markup)
+            bot.send_message(user_id, "✅ Ваше сообщение отправлено главному администратору.")
+        except Exception as e:
+            bot.send_message(user_id, "Произошла ошибка при отправке сообщения администратору.")
+            print(f"Error sending report to admin: {e}")
+    else:
+        bot.send_message(user_id, "Главный администратор в боте не настроен.")
+
+
+def prompt_admin_reply(message, target_user_id):
+    """Запрашивает у админа текст ответа пользователю."""
+    reply_text = message.text
+
+    try:
+        bot.send_message(target_user_id, f"<b>✉️ Ответ от администратора:</b>\n\n{reply_text}", parse_mode='HTML')
+        bot.send_message(message.chat.id, f"✅ Ответ успешно отправлен пользователю {target_user_id}.")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Не удалось отправить ответ пользователю {target_user_id}. Возможно, он заблокировал бота.")
+        print(f"Error sending admin reply: {e}")
+
+
+# --- Дополнительные функции БД для управления контентом ---
+
+def get_admin_content(author_id):
+    """Получает список контента, созданного конкретным администратором."""
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        # Добавляем сортировку по убыванию даты создания, чтобы новые посты были вверху
+        cursor.execute('SELECT id, text, scope, region FROM content WHERE author_id = ? ORDER BY id DESC', (author_id,))
+        results = cursor.fetchall()
+    return results
+
+def delete_content_item(content_id):
+    """Удаляет контент по его ID."""
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM content WHERE id = ?', (content_id,))
+        conn.commit()
+
+# --- Обработчики управления контентом ---
+
+@bot.message_handler(commands=['manage_content'])
+def manage_content_prompt(message):
+    user_id = message.chat.id
+    if get_user_status(user_id) != 'admin':
+        bot.send_message(user_id, "У вас нет прав администратора для управления контентом.")
+        return
+
+    content_list = get_admin_content(user_id)
+    if not content_list:
+        bot.send_message(user_id, "Вы еще не опубликовали ни одного поста.")
+        return
+
+    bot.send_message(user_id, "⬇️ **Ваши посты.** Нажмите кнопку, чтобы удалить пост:", parse_mode='Markdown')
+
+    for content in content_list:
+        content_id, text, scope, region = content
+        scope_info = f"[{region} region only 🏠]" if scope == 'region' else "[For all 🌍]"
+        display_text = text[:100] + ('...' if len(text) > 100 else '') # Обрезаем длинный текст для превью
+
+        markup = types.InlineKeyboardMarkup()
+        btn_delete = types.InlineKeyboardButton(f"Удалить пост #{content_id}", callback_data=f"delete_content_{content_id}")
+        markup.add(btn_delete)
+        
+        bot.send_message(user_id, f"#{content_id} {scope_info}\n\n{display_text}", reply_markup=markup)
 
 
 # --- 6. Запуск бота ---
