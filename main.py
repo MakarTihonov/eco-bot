@@ -1,8 +1,9 @@
 import telebot
 from telebot import types
 import sqlite3
-import time
-
+import random
+import string
+import datetime
 
 # --- Константы  ---
 TOKEN = '' 
@@ -27,6 +28,7 @@ def init_db():
     """Инициализация базы данных и создание таблиц, если их нет."""
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
+        
         # Таблица пользователей (user_id, status, username, region, city, role, is_registered, points)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
@@ -40,7 +42,7 @@ def init_db():
                 points INTEGER DEFAULT 0 
             )
         ''')
-        # ... (остальные таблицы content, events, event_registrations остаются без изменений) ...
+        
         # Таблица для хранения контента (id, text, author_id, scope ('all' или 'region'), created_at)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS content (
@@ -51,7 +53,8 @@ def init_db():
                 region TEXT
             )
         ''')
-        # >>>>> ДОБАВИТЬ ЭТУ ТАБЛИЦУ ДЛЯ ЭКО-МЕРОПРИЯТИЙ <<<<<
+        
+        # Таблица для эко-мероприятий (с добавленной колонкой check_in_code)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,19 +63,23 @@ def init_db():
                 region TEXT NOT NULL,
                 event_date TEXT,
                 location TEXT,
-                creator_id INTEGER NOT NULL
+                creator_id INTEGER NOT NULL,
+                check_in_code TEXT DEFAULT NULL 
             )
         ''')
+        
+        # Таблица для FAQ
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS faq (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 question TEXT NOT NULL,
                 answer TEXT NOT NULL,
-                region TEXT DEFAULT 'all', -- 'all' для общих вопросов, или конкретный регион
+                region TEXT DEFAULT 'all',
                 author_id INTEGER
             )
         ''')
-        # >>>>> А ТАКЖЕ ЭТУ ТАБЛИЦУ ДЛЯ ЗАПИСЕЙ НА МЕРОПРИЯТИЯ <<<<<
+        
+        # Таблица для записей на мероприятия
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS event_registrations (
                 registration_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,7 +89,22 @@ def init_db():
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS content_reports (
+                report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_id INTEGER NOT NULL,
+                reporter_user_id INTEGER NOT NULL,
+                report_text TEXT,
+                status TEXT NOT NULL DEFAULT 'pending', -- pending, resolved, dismissed
+                reported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (content_id) REFERENCES content(id),
+                FOREIGN KEY (reporter_user_id) REFERENCES users(user_id)
+            )
+        ''')
+        
         conn.commit()
+
 
 def add_faq_item(question, answer, region='all', author_id=None):
     """Добавляет новый вопрос-ответ в FAQ."""
@@ -126,6 +148,17 @@ def get_user_points(user_id):
         result = cursor.fetchone()
     return result[0] if result else 0
 
+def add_content_report(content_id, reporter_user_id, report_text):
+    """Регистрирует новую жалобу на контент."""
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO content_reports (content_id, reporter_user_id, report_text) 
+            VALUES (?, ?, ?)
+        ''', (content_id, reporter_user_id, report_text))
+        conn.commit()
+
+
 def get_top_volunteers(region=None, limit=10):
     """Получает список лучших волонтеров (по региону или глобально)."""
     with sqlite3.connect(DB_NAME) as conn:
@@ -145,24 +178,66 @@ def get_top_volunteers(region=None, limit=10):
         results = cursor.fetchall()
     return results
 
-def create_event(title, description, region, event_date, location, creator_id):
+def get_user_id_by_username(username):
+    """Получает user_id по username."""
+    # Убеждаемся, что username не содержит символ '@' в начале при поиске в БД
+    clean_username = username.lstrip('@') 
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        # Поиск без учета регистра
+        cursor.execute('SELECT user_id FROM users WHERE username LIKE ?', (clean_username,))
+        result = cursor.fetchone()
+    return result[0] if result else None
+
+
+# >>>>> ИЗМЕНЕНО: Добавлен параметр check_in_code <<<<<
+def create_event(title, description, region, event_date, location, creator_id, check_in_code=None):
     """Создает новое мероприятие в БД."""
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO events (title, description, region, event_date, location, creator_id) 
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (title, description, region, event_date, location, creator_id))
+            INSERT INTO events (title, description, region, event_date, location, creator_id, check_in_code) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (title, description, region, event_date, location, creator_id, check_in_code))
         conn.commit()
 
-def get_events_for_region(region):
-    """Получает активные мероприятия для указанного региона."""
+def get_events_for_region(region, view_mode='new'):
+    """
+    Получает активные (новые) или старые мероприятия для указанного региона.
+    view_mode: 'new' (default) or 'old'
+    """
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        # Тут можно добавить фильтрацию по дате, но пока просто все
-        cursor.execute('SELECT id, title, description, event_date, location FROM events WHERE region = ?', (region,))
+        
+        # Получаем текущую дату в том же формате 'YYYY-MM-DD', в котором она хранится
+        today_date = datetime.date.today().strftime('%Y-%m-%d')
+        
+        if view_mode == 'new':
+            # Выбираем мероприятия, дата которых больше или равна сегодняшней
+            sql_query = '''
+                SELECT id, title, description, event_date, location FROM events 
+                WHERE region = ? AND event_date >= ?
+                ORDER BY event_date ASC
+            '''
+        elif view_mode == 'old':
+            # Выбираем мероприятия, дата которых строго меньше сегодняшней
+             sql_query = '''
+                SELECT id, title, description, event_date, location FROM events 
+                WHERE region = ? AND event_date < ?
+                ORDER BY event_date DESC
+            '''
+        else:
+            # По умолчанию показываем все, если режим не указан корректно
+            sql_query = '''
+                SELECT id, title, description, event_date, location FROM events 
+                WHERE region = ?
+                ORDER BY event_date DESC
+            '''
+
+        cursor.execute(sql_query, (region, today_date))
         results = cursor.fetchall()
     return results
+
 
 def register_for_event(user_id, event_id):
     """Регистрирует пользователя на мероприятие."""
@@ -269,10 +344,11 @@ def get_all_content_for_user(user_id):
     user_region = get_user_region(user_id)
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        # Выбираем контент либо для всех ('all'), либо только для региона пользователя
-        cursor.execute('SELECT text, region, scope FROM content WHERE scope = "all" OR (scope = "region" AND region = ?)', (user_region,))
+        # !!! УБЕДИТЕСЬ, ЧТО ЗДЕСЬ ВЫБИРАЕТСЯ ID !!!
+        cursor.execute('SELECT text, region, scope, id FROM content WHERE scope = "all" OR (scope = "region" AND region = ?)', (user_region,))
         results = cursor.fetchall()
     return results
+
 
 def get_users_in_region(region):
     """Получает user_id всех пользователей в определенном регионе."""
@@ -300,24 +376,28 @@ def view_faq(message):
     user_region = get_user_region(user_id)
     
     if not user_region:
-        # Если регион не указан, показываем только глобальный FAQ
         user_region = 'N/A' 
 
     faq_items = get_faq_for_user_region(user_region)
 
     if faq_items:
-        response = f"📚 **Экологический FAQ** (для региона {user_region}):\n\n"
+        # !!! ИЗМЕНЕНО: Используем HTML <b> и <i> !!!
+        response = f"📚 <b>Экологический FAQ</b> (для региона {user_region}):\n\n"
         current_scope = None
         for question, answer, region_scope in faq_items:
             if region_scope != current_scope:
                 scope_title = "Общие вопросы 🌍" if region_scope == 'all' else f"Вопросы по вашему региону 🏠"
-                response += f"\n--- *{scope_title}* ---\n"
+                # Используем <i> для курсива
+                response += f"\n--- <i>{scope_title}</i> ---\n"
                 current_scope = region_scope
-            response += f"❓ **{question}**\n➡️ {answer}\n\n"
+            # Используем <b> для вопроса
+            response += f"❓ <b>{question}</b>\n➡️ {answer}\n\n"
         
-        bot.send_message(user_id, response, parse_mode='Markdown')
+        # !!! Добавляем parse_mode='HTML' !!!
+        bot.send_message(user_id, response, parse_mode='HTML')
     else:
         bot.send_message(user_id, "К сожалению, раздел FAQ пока пуст.")
+
 
 
 @bot.message_handler(commands=['add_faq'])
@@ -333,6 +413,22 @@ def prompt_add_faq(message):
         bot.register_next_step_handler(msg, process_faq_scope)
     else:
         bot.send_message(user_id, "У вас нет прав для добавления FAQ. 🚫")
+
+def get_user_event_history(user_id, limit=3):
+    """Получает названия и даты последних мероприятий, в которых участвовал пользователь."""
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT E.title, E.event_date
+            FROM event_registrations AS ER
+            JOIN events AS E ON ER.event_id = E.id
+            WHERE ER.user_id = ?
+            ORDER BY E.event_date DESC 
+            LIMIT ?
+        ''', (user_id, limit))
+        results = cursor.fetchall()
+    return results
+
 
 def process_faq_scope(message):
     user_id = message.chat.id
@@ -361,7 +457,8 @@ def process_faq_question(message):
     if user_id not in bot.user_data or 'scope' not in bot.user_data[user_id]: return
     
     bot.user_data[user_id]['question'] = message.text
-    msg = bot.send_message(user_id, "Теперь введите **ответ** на этот вопрос:")
+    # !!! ДОБАВЛЯЕМ parse_mode='Markdown' сюда, чтобы следующий ввод сохранял разметку !!!
+    msg = bot.send_message(user_id, "Теперь введите **ответ** на этот вопрос:", parse_mode='Markdown')
     bot.register_next_step_handler(msg, process_faq_answer)
 
 def process_faq_answer(message):
@@ -420,9 +517,10 @@ def send_welcome(message):
 # команда help
 @bot.message_handler(commands=['help'])
 def help(message):
-    bot.send_message(message.chat.id, "Привет, вот, что я умею: \n" \
+    bot.send_message(message.chat.id, "Привет, вот, что я умею: \n" 
     "\n"
-    "/view_content - посмотреть посты, которые доступны для вас. \n"
+    "/view_content - посмотреть посты, которые доступны для вас. \n" 
+    "/view_events - для просмотра и записи на доступные мероприятия. \n"
     "/admin - доступные команды для администратора. \n"
     "/request_admin - для заявки на должность админимстратора. \n"
     "/report_admin - для жалобы на администратора или контент. \n"
@@ -430,7 +528,8 @@ def help(message):
     "/profile - чтобы посмотреть свой профиль. \n"
     "/my_rating - посмотреть свой рейтинг. \n"
     "/top_volunteers - рейтинг пользователей по региону. \n"
-    "/eco_faq - Посмотреть полезную информацию и ответы на вопросы. \n"
+    "/eco_faq - Посмотреть полезную информацию и ответы на вопросы. \n" 
+    "/checkin - Для проверки на регистрацию. \n"
     "/cancel - отмена действия. ") 
 
 @bot.message_handler(commands=['admin'])
@@ -443,12 +542,12 @@ def admin(message):
         "/add_content - добавить контент. \n"
         "/admin_panel - панель администратора. \n" 
         "/manage_content - удалить и посмотреть контент.\n" 
-        "/award_points - добавить баллы. \n")
+        "/award_points - добавить баллы. \n" 
+        "/create_event - создать мероприятие. \n")
     else:
         bot.send_message(message.chat.id, "Вы не являетесь администратором!")
 
 
-# Шаг 1: Получение региона
 # Шаг 1: Получение региона
 def process_region_step(message):
     user_id = message.chat.id
@@ -542,16 +641,31 @@ def request_admin_access(message):
 
 @bot.message_handler(commands=['view_content'])
 def view_content(message):
-    content_list = get_all_content_for_user(message.chat.id)
+    user_id = message.chat.id
+    # Убедитесь, что get_all_content_for_user возвращает ID
+    content_list = get_all_content_for_user(user_id) 
     if content_list:
-        response = "Последние записи (доступные вам): 👇\n\n"
+        bot.send_message(user_id, "Последние записи (доступные вам): 👇", reply_markup=types.ReplyKeyboardRemove())
+
         for content in content_list:
-            text, region, scope = content
+            # Получаем ID из функции БД
+            text, region, scope, content_id = content 
             scope_info = f"[{region} region only 🏠]" if scope == 'region' else "[For all 🌍]"
-            response += f"- {text} {scope_info}\n"
-        bot.send_message(message.chat.id, response)
+            
+            markup = types.InlineKeyboardMarkup()
+            # Убраны иероглифы по вашему желанию
+            btn_report = types.InlineKeyboardButton("Пожаловаться", callback_data=f"report_content_{content_id}")
+            markup.add(btn_report)
+
+            # !!! ИЗМЕНЕНО ФОРМАТИРОВАНИЕ: Используем HTML <b> для жирного заголовка !!!
+            # Используем <code> для scope_info, чтобы он не конфликтовал с HTML
+            response_text = f"<b>{text}</b> <code>{scope_info}</code>"
+
+            # !!! Добавляем parse_mode='HTML' !!!
+            bot.send_message(user_id, response_text, reply_markup=markup, parse_mode='HTML')
     else:
-        bot.send_message(message.chat.id, "К сожалению, пока нет ни одной записи, доступной для вашего региона или всех пользователей.")
+        bot.send_message(user_id, "К сожалению, пока нет ни одной записи, доступной для вашего региона или всех пользователей.")
+
 
 @bot.message_handler(commands=['add_content'])
 def prompt_add_content(message):
@@ -561,8 +675,10 @@ def prompt_add_content(message):
     if status == 'admin':
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
         markup.add('Опубликовать для всех 🌍', 'Опубликовать только для моего региона 🏠')
-        msg = bot.send_message(user_id, "Отправьте текст, который вы хотите опубликовать, а затем выберите область видимости:", reply_markup=markup)
-        # Сохраняем состояние, что пользователь начал процесс добавления контента
+        
+        # !!! ДОБАВЛЯЕМ parse_mode='Markdown' сюда, чтобы следующий ввод сохранял разметку !!!
+        msg = bot.send_message(user_id, "Отправьте текст, который вы хотите опубликовать, а затем выберите область видимости:", reply_markup=markup, parse_mode='Markdown')
+        
         if user_id not in bot.user_data:
             bot.user_data[user_id] = {}
         bot.user_data[user_id]['adding_content'] = True
@@ -598,6 +714,71 @@ def process_content_scope_step(message):
     bot.register_next_step_handler(msg, process_content_step)
 
 # --- Команды для работы с мероприятиями ---
+
+def get_event_by_code(code):
+    """Получает детали мероприятия по коду регистрации."""
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        # Ищем активное мероприятие с таким кодом
+        # (в идеале тут нужна проверка на дату, но пока просто ищем код)
+        cursor.execute('SELECT id, title FROM events WHERE check_in_code = ?', (code,))
+        result = cursor.fetchone()
+    return result
+
+def has_user_checked_in(user_id, event_id):
+    """Проверяет, получил ли пользователь уже баллы за это мероприятие."""
+    # Мы используем таблицу event_registrations для двойной проверки.
+    # Если пользователь записан, мы считаем, что он может подтвердить участие.
+    # Чтобы предотвратить двойное начисление баллов, мы могли бы создать новую таблицу 'checkins',
+    # но пока будем считать, что регистрация + ввод кода = баллы.
+    # Реальная защита от двойного начисления баллов сложнее и требует дополнительных проверок.
+    pass # Пока оставим эту логику внутри process_checkin_code
+
+def process_checkin_code(message):
+    user_id = message.chat.id
+
+    # >>> ИСПРАВЛЕНИЕ: Проверяем команду отмены <<<
+    if message.text == '/cancel':
+        # Вызываем вашу существующую функцию отмены
+        cancel_process(message) 
+        # Важно: cancel_process уже очистит bot.user_data[user_id], 
+        # поэтому здесь мы просто выходим из функции.
+        return
+        
+    if user_id not in bot.user_data or not bot.user_data[user_id].get('awaiting_checkin_code'): 
+        # Если данные уже очищены функцией cancel_process, просто выходим
+        return
+    
+    code = message.text.strip().upper() # Приводим код к верхнему регистру для сравнения
+
+    event_data = get_event_by_code(code)
+
+    if not event_data:
+        bot.send_message(user_id, "❌ Неверный или устаревший код участия. Попробуйте еще раз или введите /cancel.")
+        # Оставляем next_step_handler активным, чтобы пользователь мог попробовать снова
+        bot.register_next_step_handler(message, process_checkin_code)
+        return
+
+    # ... (остальная логика проверки регистрации и начисления баллов остается прежней) ...
+
+    event_id, event_title = event_data
+
+    # УСЛОВИЕ 1: Пользователь должен быть зарегистрирован на мероприятие
+    if not is_user_registered_for_event(user_id, event_id):
+        bot.send_message(user_id, f"❌ Вы не зарегистрированы на мероприятие «{event_title}». Пожалуйста, сначала запишитесь через /view_events.")
+        del bot.user_data[user_id]
+        return
+
+    # УСЛОВИЕ 2: Начисление баллов
+    POINTS_FOR_CHECKIN = 3
+    add_points(user_id, POINTS_FOR_CHECKIN)
+
+    bot.send_message(user_id, 
+                     f"🎉 Успешная регистрация на месте! Вы получили **{POINTS_FOR_CHECKIN} баллов** за участие в «{event_title}».",
+                     parse_mode='Markdown')
+    
+    del bot.user_data[user_id]
+
 
 @bot.message_handler(commands=['create_event'])
 def prompt_create_event(message):
@@ -640,6 +821,50 @@ def process_event_description(message):
     msg = bot.send_message(user_id, "Введите **дату и время** мероприятия (например, '25.12 в 14:00'):")
     bot.register_next_step_handler(msg, process_event_date)
 
+def process_report_reason(message):
+    user_id = message.chat.id
+    if user_id not in bot.user_data or 'reporting_content_id' not in bot.user_data[user_id]:
+        bot.send_message(user_id, "Произошла ошибка при подаче жалобы. Попробуйте снова /view_content.")
+        return
+
+    content_id = bot.user_data[user_id]['reporting_content_id']
+    report_text = message.text
+    reporter_username = message.from_user.username or f"ID: {user_id}"
+
+    # Сохраняем жалобу в БД
+    add_content_report(content_id, user_id, report_text)
+
+    bot.send_message(user_id, "✅ Ваша жалоба принята и отправлена на рассмотрение модераторам.")
+
+    # >>> УВЕДОМЛЕНИЕ АДМИНИСТРАТОРОВ <<<
+    # Нужно получить список всех администраторов, чтобы отправить им уведомление
+    admins = get_all_admins()
+    if not admins:
+        # Если админов нет, отправляем главному админу
+        if MAIN_ADMIN_ID:
+            admins = [(MAIN_ADMIN_ID, 'MainAdmin')]
+
+    notification_message = (
+        f"<b>🚨 НОВАЯ ЖАЛОБА НА КОНТЕНТ #{content_id} 🚨</b>\n\n"
+        f"От пользователя: @{reporter_username}\n"
+        f"Причина: {report_text}\n\n"
+        f"Чтобы посмотреть контент: /view_content \n"
+        f"Чтобы удалить контент: /manage_content"
+    )
+    
+    # Отправляем уведомление каждому администратору
+    for admin_id, _ in admins:
+        try:
+            # Не отправляем самому себе, если админ сам подал жалобу (хотя это маловероятно)
+            if admin_id != user_id:
+                bot.send_message(admin_id, notification_message, parse_mode='HTML')
+        except Exception as e:
+            print(f"Ошибка при отправке уведомления админу {admin_id}: {e}")
+
+    # Очищаем данные пользователя
+    del bot.user_data[user_id]
+
+
 def process_event_date(message):
     user_id = message.chat.id
     if user_id not in bot.user_data: return
@@ -652,13 +877,18 @@ def process_event_date(message):
     msg = bot.send_message(user_id, "Введите **место проведения** (адрес или координаты):")
     bot.register_next_step_handler(msg, process_event_location)
 
+def generate_check_in_code(length=6):
+    """Генерирует случайный 6-значный буквенно-цифровой код."""
+    # Используем только заглавные буквы и цифры для легкости ввода
+    characters = string.ascii_uppercase + string.digits
+    return ''.join(random.choice(characters) for i in range(length))
+
 def process_event_location(message):
     user_id = message.chat.id
     # Проверка, что данные существуют и это текст, не команда
     if user_id not in bot.user_data or message.content_type != 'text' or message.text.startswith('/'):
         msg = bot.send_message(user_id, "Неверный ввод. Введите **место проведения** текстом.")
         if user_id in bot.user_data:
-             # Если данные потеряны из-за сбоя, попросим начать заново
              if 'date' not in bot.user_data[user_id]:
                   bot.send_message(user_id, "Ошибка в предыдущих данных, начните заново: /create_event")
                   del bot.user_data[user_id]
@@ -666,25 +896,33 @@ def process_event_location(message):
              bot.register_next_step_handler(msg, process_event_location)
         return
         
-    # <-- ОШИБКА БЫЛА ИСПРАВЛЕНА ЗДЕСЬ -->
     bot.user_data[user_id]['location'] = message.text 
     user_data = bot.user_data[user_id]
+    
+    # >>>>> НОВОЕ: ГЕНЕРИРУЕМ КОД ПРОВЕРКИ <<<<<
+    check_in_code = generate_check_in_code()
 
     create_event(
         title=user_data['title'],
         description=user_data['description'],
         region=user_data['region'],
         event_date=user_data['date'],
-        location=user_data['location'], # Теперь location точно существует
-        creator_id=user_id
+        location=user_data['location'],
+        creator_id=user_id,
+        check_in_code=check_in_code # Передаем код в функцию создания
     )
 
-    bot.send_message(user_id, "🎉 Мероприятие успешно создано и доступно пользователям в вашем регионе!")
+    # >>>>> НОВОЕ: СООБЩАЕМ АДМИНУ КОД <<<<<
+    bot.send_message(user_id, 
+                     f"🎉 Мероприятие успешно создано и доступно пользователям в вашем регионе!\n\n"
+                     f"🔑 **КОД ПРОВЕРКИ УЧАСТИЯ:** `{check_in_code}`\n\n"
+                     f"Сообщите этот код участникам на мероприятии, чтобы они могли получить баллы через команду /checkin",
+                     parse_mode='Markdown')
+                     
     del bot.user_data[user_id]
 
-
 @bot.message_handler(commands=['view_events'])
-def view_events(message):
+def prompt_view_events_choice(message):
     user_id = message.chat.id
     region = get_user_region(user_id)
 
@@ -692,30 +930,88 @@ def view_events(message):
         bot.send_message(user_id, "Чтобы просматривать мероприятия, пожалуйста, укажите свой регион в /start или /change.")
         return
         
-    events_list = get_events_for_region(region)
+    markup = types.InlineKeyboardMarkup()
+    btn_new = types.InlineKeyboardButton("Актуальные (Новые) 🌳", callback_data=f"view_events_new_{region}")
+    btn_old = types.InlineKeyboardButton("Прошедшие (Старые) ⏳", callback_data=f"view_events_old_{region}")
+    markup.add(btn_new, btn_old)
+
+    bot.send_message(user_id, f"В регионе {region}. Какие мероприятия показать?", reply_markup=markup)
+
+# >>>>> НОВЫЙ ОБРАБОТЧИК CALLBACK ДЛЯ КНОПОК ВЫБОРА <<<<<
+@bot.callback_query_handler(func=lambda call: call.data.startswith('view_events_'))
+def handle_view_events_callback(call):
+    user_id = call.message.chat.id
+    bot.answer_callback_query(call.id)
+    
+    # call.data будет иметь формат: "view_events_new_RegionName"
+    parts = call.data.split('_')
+    # parts[0] = 'view'
+    # parts[1] = 'events'
+    # parts[2] = 'new' (или 'old')
+    # parts[3] = 'RegionName'
+    
+    view_mode = parts[2]
+    region_name = parts[3]
+
+    display_events_list(user_id, region_name, view_mode)
+
+
+# >>>>> НОВАЯ ФУНКЦИЯ ДЛЯ ОТОБРАЖЕНИЯ СПИСКА МЕРОПРИЯТИЙ <<<<<
+def display_events_list(user_id, region, view_mode):
+    events_list = get_events_for_region(region, view_mode)
+    
+    title_text = "Актуальные мероприятия" if view_mode == 'new' else "Прошедшие мероприятия"
 
     if events_list:
-        bot.send_message(user_id, f"🌳 Актуальные мероприятия в вашем регионе ({region}):", reply_markup=types.ReplyKeyboardRemove())
+        bot.send_message(user_id, f"🌳 {title_text} в вашем регионе ({region}):", reply_markup=types.ReplyKeyboardRemove())
         for event in events_list:
             event_id, title, description, date, location = event
             response = (
                 f"**{title}**\n\n"
                 f"🗓️ **Дата/Время:** {date}\n"
                 f"📍 **Место:** {location}\n\n"
-                f"{description[:200]}..." # Обрезаем описание
+                f"{description[:200]}..."
             )
             
             markup = types.InlineKeyboardMarkup()
-            if not is_user_registered_for_event(user_id, event_id):
-                btn_register = types.InlineKeyboardButton("Я пойду! Записаться ✅", callback_data=f"register_event_{event_id}")
-                markup.add(btn_register)
+            # Кнопка записи нужна только для новых мероприятий
+            if view_mode == 'new':
+                 if not is_user_registered_for_event(user_id, event_id):
+                    btn_register = types.InlineKeyboardButton("Я пойду! Записаться ✅", callback_data=f"register_event_{event_id}")
+                    markup.add(btn_register)
+                 else:
+                    btn_registered = types.InlineKeyboardButton("Вы уже записаны 👍", callback_data="ignore")
+                    markup.add(btn_registered)
             else:
-                btn_registered = types.InlineKeyboardButton("Вы уже записаны 👍", callback_data="ignore")
-                markup.add(btn_registered)
+                 # Для старых мероприятий просто информационная кнопка
+                 btn_info = types.InlineKeyboardButton("Мероприятие завершено 🚫", callback_data="ignore")
+                 markup.add(btn_info)
+
 
             bot.send_message(user_id, response, reply_markup=markup, parse_mode='Markdown')
     else:
-        bot.send_message(user_id, f"К сожалению, в регионе {region} пока нет запланированных мероприятий.")
+        bot.send_message(user_id, f"К сожалению, {title_text.lower()} в регионе {region} пока нет.")
+
+
+
+def choose_input_method_step(message):
+    user_id = message.chat.id
+    if user_id not in bot.user_data or not bot.user_data[user_id].get('awaiting_points_method'): return
+
+    if 'id' in message.text.lower():
+        method = 'id'
+        prompt_text = "Вы выбрали ввод по ID. Введите ID пользователя и баллы (пример: `123456789 50`):"
+    elif 'username' in message.text.lower():
+        method = 'username'
+        prompt_text = "Вы выбрали ввод по Username. Введите Username и баллы (пример: `@username 50`):"
+    else:
+        msg = bot.send_message(user_id, "Неверный выбор. Пожалуйста, используйте кнопки.")
+        bot.register_next_step_handler(msg, choose_input_method_step)
+        return
+
+    bot.user_data[user_id]['method'] = method
+    msg = bot.send_message(user_id, prompt_text, reply_markup=types.ReplyKeyboardRemove(), parse_mode='Markdown')
+    bot.register_next_step_handler(msg, process_award_points)
 
 
 def process_content_step(message):
@@ -856,7 +1152,15 @@ def view_admin_list(message):
     else:
         bot.send_message(message.chat.id, "Кроме вас, администраторов нет.")
 
-# --- 5. Обработка Inline кнопок (Одобрение/Отклонение/Лишение прав/Ответ/Удаление контента) ---
+def get_user_id_by_username(username):
+    """Получает user_id по username."""
+    clean_username = username.lstrip('@') 
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id FROM users WHERE username LIKE ?', (clean_username,))
+        result = cursor.fetchone()
+    return result # result будет None или кортеж, например (12345,)
+
 
 # --- 5. Обработка Inline кнопок (Одобрение/Отклонение/Лишение прав/Ответ/Удаление контента/Регистрация на ивент) ---
 
@@ -905,6 +1209,20 @@ def callback_handler(call):
         except: pass
         bot.edit_message_text(f"Пользователь (ID: {target_id}) лишен прав администратора.", call.message.chat.id, call.message.message_id, reply_markup=None, parse_mode='HTML')
     
+    # --- Логика жалоб на контент ---
+    elif action == 'report' and data_parts[1] == 'content':
+        content_id = target_id # target_id из парсинга в начале функции callback_handler
+        reporter_id = call.message.chat.id
+        
+        # Запрашиваем у пользователя причину жалобы
+        msg = bot.send_message(reporter_id, "Опишите причину вашей жалобы на этот пост:")
+        
+        # Сохраняем content_id во временных данных и регистрируем следующий шаг
+        bot.user_data[reporter_id] = {'reporting_content_id': content_id}
+        bot.register_next_step_handler(msg, process_report_reason)
+        
+        bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None) # Убираем кнопку "Пожаловаться" после нажатия
+
     elif action == 'reply':
         if user_id != MAIN_ADMIN_ID: bot.send_message(user_id, "Это действие доступно только главному администратору."); return
         msg = bot.send_message(user_id, f"Введите ответ для пользователя {target_id}:")
@@ -951,62 +1269,136 @@ def get_user_details(user_id):
         result = cursor.fetchone()
     return result
 
+@bot.message_handler(commands=['checkin'])
+def prompt_checkin_code(message):
+    user_id = message.chat.id
+    if not is_user_registered(user_id):
+        enforce_registration(message)
+        return
+        
+    msg = bot.send_message(user_id, "Введите **код участия** мероприятия, который вам предоставил организатор:")
+    # Сохраняем состояние, что пользователь ожидает ввода кода
+    bot.user_data[user_id] = {'awaiting_checkin_code': True}
+    bot.register_next_step_handler(msg, process_checkin_code)
+
+
 @bot.message_handler(commands=['profile'])
 def view_profile(message):
     user_id = message.chat.id
     details = get_user_details(user_id)
+    
     if details:
         username, region, city, role, status = details
-        points = get_user_points(user_id) # <-- Добавлено получение баллов
+        points = get_user_points(user_id)
+        
+        # Получаем историю мероприятий
+        history = get_user_event_history(user_id, limit=3)
+
         response = (
             f"👤 Ваш профиль:\n"
             f"--------------------------\n"
+            f"ID: <code>{user_id}</code>\n"
             f"Ник: @{username}\n"
             f"Статус: {status}\n"
             f"Роль: {role}\n"
             f"Регион: {region}\n"
             f"Город: {city}\n"
-            f"🌟 **Баллы:** {points}\n" # <-- Добавлено отображение баллов
+            f"<b>Баллы:</b> {points}\n"
             f"--------------------------\n"
-            f"Чтобы изменить данные: /change"
         )
-        bot.send_message(user_id, response, parse_mode='Markdown')
+        
+        # >>>>> ДОБАВЛЯЕМ ИСТОРИЮ ВЫВОДА <<<<<
+        if history:
+            response += f"\n🗓️ <b>Последние мероприятия:</b>\n"
+            for title, date in history:
+                response += f"— <i>{title}</i> ({date})\n"
+        else:
+            response += f"\n🗓️ Вы пока не участвовали ни в одном мероприятии.\n"
+        # ------------------------------------
+
+        response += f"\nЧтобы изменить данные: /change"
+
+        # Обязательно указываем parse_mode='HTML'
+        bot.send_message(user_id, response, parse_mode='HTML') 
     else:
         bot.send_message(user_id, "Произошла ошибка при получении данных профиля. Попробуйте /start.")
+
 
 @bot.message_handler(commands=['award_points'])
 def prompt_award_points(message):
     user_id = message.chat.id
     status = get_user_status(user_id)
 
-    # Проверяем, является ли пользователь администратором или куратором
-    if status == 'admin' or get_user_details(user_id)[3] == 'Куратор': 
-        msg = bot.send_message(user_id, "Введите ID пользователя и количество баллов через пробел (например: 123456789 50)")
-        bot.register_next_step_handler(msg, process_award_points)
+    # Проверяем права администратора/куратора
+    if status == 'admin' or (get_user_details(user_id) and get_user_details(user_id)[3] == 'Куратор'): 
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.add('Использовать User ID (цифры) 🔢', 'Использовать Username (@логин) 👤')
+        
+        msg = bot.send_message(user_id, "Выберите способ ввода данных пользователя:", reply_markup=markup)
+        
+        # Сохраняем состояние для следующего шага
+        bot.user_data[user_id] = {'awaiting_points_method': True}
+        bot.register_next_step_handler(msg, choose_input_method_step)
     else:
-        bot.send_message(user_id, "У вас нет прав для начисления баллов.")
+        bot.send_message(user_id, "У вас нет прав для начисления или списания баллов.")
+
 
 def process_award_points(message):
+    user_id = message.chat.id
+    user_data = bot.user_data.get(user_id, {})
+    input_method = user_data.get('method')
+
+    if not input_method:
+        bot.send_message(user_id, "Произошла ошибка, начните заново: /award_points")
+        if user_id in bot.user_data: del bot.user_data[user_id]
+        return
+
     try:
         parts = message.text.split()
-        target_user_id = int(parts[0])
+        identifier = parts[0]
         points_to_add = int(parts[1])
     except (ValueError, IndexError):
-        bot.send_message(message.chat.id, "Неверный формат ввода. Попробуйте снова: /award_points")
+        bot.send_message(user_id, "Неверный формат ввода. Попробуйте снова: /award_points")
+        bot.register_next_step_handler(message, process_award_points) # Повторяем шаг, чтобы не потерять метод
         return
     
-    # Проверяем, существует ли пользователь в БД
-    if get_user_status(target_user_id) == 'new':
-        bot.send_message(message.chat.id, f"Пользователь с ID {target_user_id} не найден или не зарегистрирован.")
+    # Определяем ID пользователя в зависимости от метода ввода
+    target_user_id = None
+    if input_method == 'id':
+        try:
+            target_user_id = int(identifier)
+        except ValueError:
+            bot.send_message(user_id, "Неверный формат ID. Попробуйте снова: /award_points")
+            return
+    elif input_method == 'username':
+        # Используем функцию get_user_id_by_username, которую мы создали ранее
+        user_record = get_user_id_by_username(identifier)
+        if user_record:
+            target_user_id = user_record[0] # get_user_id_by_username возвращает кортеж, берем первый элемент
+    
+    if not target_user_id or get_user_status(target_user_id) == 'new':
+        bot.send_message(user_id, f"Пользователь с указанным ID/Username не найден или не зарегистрирован.")
+        if user_id in bot.user_data: del bot.user_data[user_id]
         return
 
     add_points(target_user_id, points_to_add)
-    bot.send_message(message.chat.id, f"✅ Пользователю {target_user_id} начислено {points_to_add} баллов.")
+    
+    # ... (логика уведомлений остается прежней) ...
+    if points_to_add >= 0:
+        bot.send_message(user_id, f"✅ Пользователю {identifier} (ID: {target_user_id}) начислено {points_to_add} баллов.")
+        notification_message = f"🎉 Вам начислено {points_to_add} баллов за вашу активность!"
+    else:
+        bot.send_message(user_id, f"✅ У пользователя {identifier} (ID: {target_user_id}) списано {abs(points_to_add)} баллов.")
+        notification_message = f"💸 С вашего счета списано {abs(points_to_add)} баллов."
     
     try:
-        bot.send_message(target_user_id, f"🎉 Вам начислено {points_to_add} баллов за вашу активность!")
-    except:
-        pass
+        bot.send_message(target_user_id, notification_message)
+    except Exception as e:
+        print(f"Не удалось отправить уведомление пользователю {target_user_id}: {e}")
+        
+    # Очищаем данные после завершения
+    if user_id in bot.user_data: del bot.user_data[user_id]
+
 
 @bot.message_handler(commands=['cancel'])
 def cancel_process(message):
@@ -1198,8 +1590,6 @@ def set_default_commands():
         print("Стандартные команды Telegram меню успешно установлены.")
     except Exception as e:
         print(f"Ошибка при установке команд меню Telegram: {e}")
-
-
 
 # --- 7. Запуск бота ---
 
