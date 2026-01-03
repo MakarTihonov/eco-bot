@@ -9,8 +9,8 @@ import pytz
 import threading
 
 # --- Константы  ---
-TOKEN = '8595755361:AAEa-Qjsqq-2AolWWrbEdy0CnSqpM_Vla4g' 
-MAIN_ADMIN_ID =  1961128598
+TOKEN = '' 
+MAIN_ADMIN_ID =  123456789
 DB_NAME = 'bot_data.db'
 #СПИСОК СУБЪЕКТОВ РФ 
 RUSSIAN_SUBJECTS = [
