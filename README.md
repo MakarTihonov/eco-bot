@@ -1,3 +1,3 @@
-# eco-bot
-if you want to take the code yourself, then use the main.py
-if you want to start a permanent job, then I recommend a bot.py
+This code is intended for telegram bots, this is my personal ECO-project. 
+To view the entire list of commands, use /all_command.
+Good luck!
